@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+RUN_NUM="${1:?run number required (e.g. 1)}"
+PROJECT_NAME="bootstrap"
+IMAGE_NAME="${IMAGE_NAME:-bootstrap-measurement-5.1.0}"
+MEDICAO_DIR="$HOME/experimentos/medicao/repositorios/bootstrap/release-5.1.0"
+RESULTS_DIR="${RESULTS_DIR:-$HOME/experimentos/medicao/resultados/bootstrap/release-5.1.0/runs}"
+LOGS_DIR="${LOGS_DIR:-$HOME/experimentos/medicao/resultados/bootstrap/release-5.1.0/logs}"
+RAPL_BASE="/sys/class/powercap/intel-rapl"
+# Idle baseline measured before each run; its per-second rate is subtracted
+# from every stage so reported energy reflects workload above idle.
+BASELINE_DURATION=120
+TIME_FILE="/tmp/bootstrap_time_$$.txt"
+CSV_FILE="$RESULTS_DIR/run_$(printf '%02d' "$RUN_NUM").csv"
+EXITS_FILE="$RESULTS_DIR/exit_codes_run_$(printf '%02d' "$RUN_NUM").txt"
+
+# No swap inside the container: the limit is the bench's usable RAM.
+MEM_LIMIT="${MEM_LIMIT:-12g}"
+MEM_SWAP="${MEM_SWAP:-$MEM_LIMIT}"
+
+PIPELINE_EXIT=0
+FAILED_STAGES=""
+
+mkdir -p "$RESULTS_DIR" "$LOGS_DIR"
+
+if [ ! -d "$RAPL_BASE" ]; then
+  echo "RAPL not available at $RAPL_BASE" >&2
+  exit 1
+fi
+
+if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+  echo "Docker image '$IMAGE_NAME' not found." >&2
+  echo "  Build it first:" >&2
+  echo "  docker build -t $IMAGE_NAME -f $MEDICAO_DIR/Dockerfile \\" >&2
+  echo "    <checkout of release-5.1.0>" >&2
+  exit 1
+fi
+
+: > "$EXITS_FILE"
+
+read_rapl() {
+  local domain_name="$1"
+  local value=0
+  for dir in "$RAPL_BASE"/*/; do
+    local name_file="$dir/name"
+    [ -f "$name_file" ] || continue
+    local name
+    name=$(cat "$name_file")
+    if [[ "$name" == "package-0" && "$domain_name" == "pkg" ]] || \
+       [[ "$name" == "core"      && "$domain_name" == "cores" ]] || \
+       [[ "$name" == "uncore"    && "$domain_name" == "gpu" ]] || \
+       [[ "$name" == "dram"      && "$domain_name" == "ram" ]]; then
+      local energy_file="$dir/energy_uj"
+      [ -f "$energy_file" ] && value=$(cat "$energy_file") && break
+    fi
+    for subdir in "$dir"*/; do
+      local sub_name_file="$subdir/name"
+      [ -f "$sub_name_file" ] || continue
+      local sub_name
+      sub_name=$(cat "$sub_name_file")
+      if [[ "$sub_name" == "core"   && "$domain_name" == "cores" ]] || \
+         [[ "$sub_name" == "uncore" && "$domain_name" == "gpu" ]] || \
+         [[ "$sub_name" == "dram"   && "$domain_name" == "ram" ]]; then
+        local sub_energy="$subdir/energy_uj"
+        [ -f "$sub_energy" ] && value=$(cat "$sub_energy") && break 2
+      fi
+    done
+  done
+  echo "$value"
+}
+
+read_rapl_max() {
+  local domain_name="$1"
+  local value=0
+  for dir in "$RAPL_BASE"/*/; do
+    local name_file="$dir/name"
+    [ -f "$name_file" ] || continue
+    local name
+    name=$(cat "$name_file")
+    if [[ "$name" == "package-0" && "$domain_name" == "pkg" ]]; then
+      local max_file="$dir/max_energy_range_uj"
+      [ -f "$max_file" ] && value=$(cat "$max_file") && break
+    fi
+    for subdir in "$dir"*/; do
+      local sub_name_file="$subdir/name"
+      [ -f "$sub_name_file" ] || continue
+      local sub_name
+      sub_name=$(cat "$sub_name_file")
+      if [[ "$sub_name" == "core"   && "$domain_name" == "cores" ]] || \
+         [[ "$sub_name" == "uncore" && "$domain_name" == "gpu" ]] || \
+         [[ "$sub_name" == "dram"   && "$domain_name" == "ram" ]]; then
+        local sub_max="$subdir/max_energy_range_uj"
+        [ -f "$sub_max" ] && value=$(cat "$sub_max") && break 2
+      fi
+    done
+  done
+  [ "$value" -eq 0 ] && value=999999999999
+  echo "$value"
+}
+
+# RAPL counters wrap at max_energy_range_uj; deltas are overflow-corrected.
+delta_uj() {
+  local ini="$1" fin="$2" max="$3"
+  if [ "$fin" -ge "$ini" ]; then
+    echo $(( fin - ini ))
+  else
+    echo $(( max - ini + fin ))
+  fi
+}
+
+# Host swap counters and package temperature, read immediately before and
+# after each stage's RAPL window, never inside it; recorded as sidecars, not
+# CSV columns (the 14-column schema is pre-registered).
+read_swap() { awk -v k="$1" '$1==k {print $2}' /proc/vmstat; }
+TEMP_SENSOR=""
+for hw in /sys/class/hwmon/hwmon*; do
+  [ "$(cat "$hw/name" 2>/dev/null)" = "coretemp" ] || continue
+  for lbl in "$hw"/temp*_label; do
+    [ "$(cat "$lbl" 2>/dev/null)" = "Package id 0" ] && TEMP_SENSOR="${lbl%_label}_input" && break 2
+  done
+done
+read_temp_c() { if [ -n "$TEMP_SENSOR" ] && [ -r "$TEMP_SENSOR" ]; then awk '{printf "%.1f", $1/1000}' "$TEMP_SENSOR"; else echo ""; fi; }
+
+echo ""
+echo ""
+echo " Run $RUN_NUM - $PROJECT_NAME"
+echo " $(date '+%Y-%m-%d %H:%M:%S')"
+echo ""
+echo "Baseline rest (${BASELINE_DURATION}s)..."
+
+b_pkg_ini=$(read_rapl pkg)
+b_cores_ini=$(read_rapl cores)
+b_gpu_ini=$(read_rapl gpu)
+b_ram_ini=$(read_rapl ram)
+
+sleep "$BASELINE_DURATION"
+
+b_pkg_fin=$(read_rapl pkg)
+b_cores_fin=$(read_rapl cores)
+b_gpu_fin=$(read_rapl gpu)
+b_ram_fin=$(read_rapl ram)
+
+max_pkg=$(read_rapl_max pkg)
+max_cores=$(read_rapl_max cores)
+max_gpu=$(read_rapl_max gpu)
+max_ram=$(read_rapl_max ram)
+
+b_delta_pkg=$(delta_uj "$b_pkg_ini" "$b_pkg_fin" "$max_pkg")
+b_delta_cores=$(delta_uj "$b_cores_ini" "$b_cores_fin" "$max_cores")
+b_delta_gpu=$(delta_uj "$b_gpu_ini" "$b_gpu_fin" "$max_gpu")
+b_delta_ram=$(delta_uj "$b_ram_ini" "$b_ram_fin" "$max_ram")
+
+taxa_pkg=$(awk  "BEGIN {printf \"%.6f\", $b_delta_pkg  / $BASELINE_DURATION}")
+taxa_cores=$(awk "BEGIN {printf \"%.6f\", $b_delta_cores / $BASELINE_DURATION}")
+taxa_gpu=$(awk  "BEGIN {printf \"%.6f\", $b_delta_gpu  / $BASELINE_DURATION}")
+taxa_ram=$(awk  "BEGIN {printf \"%.6f\", $b_delta_ram  / $BASELINE_DURATION}")
+
+# Recorded per run: the rate drives the subtraction, so it has to be auditable
+# alongside the energy it produced.
+taxa_pkg_w=$(awk   "BEGIN {printf \"%.6f\", $taxa_pkg   / 1e6}")
+taxa_cores_w=$(awk "BEGIN {printf \"%.6f\", $taxa_cores / 1e6}")
+taxa_ram_w=$(awk   "BEGIN {printf \"%.6f\", $taxa_ram   / 1e6}")
+
+echo "Baseline rate:"
+echo "   pkg:   $(awk "BEGIN {printf \"%.2f\", $taxa_pkg_w}") W"
+echo "   cores: $(awk "BEGIN {printf \"%.2f\", $taxa_cores_w}") W"
+echo "   ram:   $(awk "BEGIN {printf \"%.2f\", $taxa_ram_w}") W"
+
+echo "run,stage,energy_pkg_j,energy_cores_j,energy_gpu_j,energy_ram_j,wall_time_s,user_time_s,sys_time_s,energy_ram_liquid_raw_j,wall_time_container_s,baseline_rate_pkg_w,baseline_rate_cores_w,baseline_rate_ram_w" \
+  > "$CSV_FILE"
+
+total_pkg=0; total_cores=0; total_gpu=0; total_ram=0; total_ram_raw=0
+total_wall=0; total_user=0; total_sys=0; total_wall_container=0
+
+measure_stage() {
+  local stage="$1"
+  echo ""
+  echo " Stage: $stage - $(date '+%H:%M:%S')"
+
+  local timing_dir
+  timing_dir=$(mktemp -d)
+
+  local swap_in_ini swap_out_ini temp_ini
+  swap_in_ini=$(read_swap pswpin); swap_out_ini=$(read_swap pswpout); temp_ini=$(read_temp_c)
+
+  local ini_pkg ini_cores ini_gpu ini_ram
+  ini_pkg=$(read_rapl pkg)
+  ini_cores=$(read_rapl cores)
+  ini_gpu=$(read_rapl gpu)
+  ini_ram=$(read_rapl ram)
+
+  local stage_log="$LOGS_DIR/run_$(printf '%02d' "$RUN_NUM")_${stage}.log"
+  local stage_exit=0
+  set +e
+  # --network none: all inputs are pre-baked into the image; measured energy
+  # must not include network traffic (construct definition).
+  # fd3 preserves the workload stderr while `time` captures wall/user/sys inside
+  # the container, so child CPU time is attributed to the stage.
+  /usr/bin/time -f "%e" -o "$TIME_FILE" \
+    docker run --rm --privileged --network none \
+      --memory="$MEM_LIMIT" --memory-swap="$MEM_SWAP" \
+      -v "$MEDICAO_DIR:/medicao:ro" \
+      -v "$timing_dir:/timing" \
+      -e "STAGE=$stage" \
+      "$IMAGE_NAME" \
+      bash -c 'exec 3>&2; TIMEFORMAT="%R %U %S"; { time bash /medicao/commands.sh "$STAGE" 2>&3; } 2>/timing/time.txt' \
+      2>&1 | tee "$stage_log"
+  stage_exit=${PIPESTATUS[0]}
+  set -e
+  echo "  stage log: $stage_log"
+
+  # The exit code is the only rejection criterion; the measurement is kept
+  # either way.
+  echo "$RUN_NUM,$stage,$stage_exit" >> "$EXITS_FILE"
+  if [ "$stage_exit" -ne 0 ]; then
+    echo "  stage '$stage': container exited with exit=$stage_exit (measurement PRESERVED, see $EXITS_FILE)"
+    PIPELINE_EXIT="$stage_exit"
+    FAILED_STAGES="${FAILED_STAGES:+$FAILED_STAGES }$stage(exit=$stage_exit)"
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+      echo "::warning title=Stage exited non-zero::Run $RUN_NUM, stage '$stage': exit=$stage_exit. The CSV row WAS written."
+    fi
+  else
+    echo "  stage '$stage': container exited 0"
+  fi
+
+  local fin_pkg fin_cores fin_gpu fin_ram
+  fin_pkg=$(read_rapl pkg)
+  fin_cores=$(read_rapl cores)
+  fin_gpu=$(read_rapl gpu)
+  fin_ram=$(read_rapl ram)
+
+  local swap_in_fin swap_out_fin temp_fin
+  swap_in_fin=$(read_swap pswpin); swap_out_fin=$(read_swap pswpout); temp_fin=$(read_temp_c)
+  {
+    echo "pswpin_start,$swap_in_ini"
+    echo "pswpout_start,$swap_out_ini"
+    echo "pswpin_end,$swap_in_fin"
+    echo "pswpout_end,$swap_out_fin"
+    echo "swap_in_pages,$(( swap_in_fin - swap_in_ini ))"
+    echo "swap_out_pages,$(( swap_out_fin - swap_out_ini ))"
+  } > "$RESULTS_DIR/swap_run_$(printf '%02d' "$RUN_NUM")_${stage}.txt"
+  {
+    echo "sensor,${TEMP_SENSOR:--}"
+    echo "label,Package id 0"
+    echo "temp_pkg_start_c,$temp_ini"
+    echo "temp_pkg_end_c,$temp_fin"
+  } > "$RESULTS_DIR/temp_run_$(printf '%02d' "$RUN_NUM")_${stage}.txt"
+
+  local wall wall_container_t user_t sys_t
+  # GNU time prepends a status line on non-zero exit; the elapsed value is last.
+  wall=$(tail -n 1 "$TIME_FILE")
+  if ! [[ "$wall" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "  non-numeric wall_time ('$wall') - writing 0 and continuing" >&2
+    wall="0.00"
+  fi
+  if [ -f "$timing_dir/time.txt" ]; then
+    read -r wall_container_t user_t sys_t < "$timing_dir/time.txt"
+  else
+    wall_container_t="0.000"; user_t="0.000"; sys_t="0.000"
+  fi
+  rm -rf "$timing_dir"
+
+  local d_pkg d_cores d_gpu d_ram
+  d_pkg=$(delta_uj   "$ini_pkg"   "$fin_pkg"   "$max_pkg")
+  d_cores=$(delta_uj "$ini_cores" "$fin_cores" "$max_cores")
+  d_gpu=$(delta_uj   "$ini_gpu"   "$fin_gpu"   "$max_gpu")
+  d_ram=$(delta_uj   "$ini_ram"   "$fin_ram"   "$max_ram")
+
+  local j_pkg j_cores j_gpu j_ram j_ram_raw
+  j_pkg=$(awk   "BEGIN {v=($d_pkg   - $taxa_pkg   * $wall) / 1e6; printf \"%.6f\", (v>0?v:0)}")
+  j_cores=$(awk "BEGIN {v=($d_cores - $taxa_cores * $wall) / 1e6; printf \"%.6f\", (v>0?v:0)}")
+  j_gpu=$(awk   "BEGIN {v=($d_gpu   - $taxa_gpu   * $wall) / 1e6; printf \"%.6f\", (v>0?v:0)}")
+  j_ram=$(awk   "BEGIN {v=($d_ram   - $taxa_ram   * $wall) / 1e6; printf \"%.6f\", (v>0?v:0)}")
+
+  j_ram_raw=$(awk "BEGIN {printf \"%.6f\", ($d_ram - $taxa_ram * $wall) / 1e6}")
+
+  echo "  ram: delta=${d_ram}uJ baseline=$(awk "BEGIN {printf \"%.0f\", $taxa_ram * $wall}")uJ net=$(awk "BEGIN {printf \"%.3f\", ($d_ram - $taxa_ram * $wall) / 1e6}")J clamped=${j_ram}J"
+
+  echo "$RUN_NUM,$stage,$j_pkg,$j_cores,$j_gpu,$j_ram,$wall,$user_t,$sys_t,$j_ram_raw,$wall_container_t,$taxa_pkg_w,$taxa_cores_w,$taxa_ram_w" >> "$CSV_FILE"
+
+  total_pkg=$(awk   "BEGIN {printf \"%.6f\", $total_pkg   + $j_pkg}")
+  total_cores=$(awk "BEGIN {printf \"%.6f\", $total_cores + $j_cores}")
+  total_gpu=$(awk   "BEGIN {printf \"%.6f\", $total_gpu   + $j_gpu}")
+  total_ram=$(awk   "BEGIN {printf \"%.6f\", $total_ram   + $j_ram}")
+  total_ram_raw=$(awk "BEGIN {printf \"%.6f\", $total_ram_raw + $j_ram_raw}")
+  total_wall=$(awk  "BEGIN {printf \"%.3f\", $total_wall  + $wall}")
+  total_user=$(awk  "BEGIN {printf \"%.3f\", $total_user  + $user_t}")
+  total_sys=$(awk   "BEGIN {printf \"%.3f\", $total_sys   + $sys_t}")
+  total_wall_container=$(awk "BEGIN {printf \"%.3f\", $total_wall_container + $wall_container_t}")
+
+  echo "    pkg: ${j_pkg}J | cores: ${j_cores}J | ram: ${j_ram}J | wall: ${wall}s"
+}
+
+measure_stage build
+measure_stage test
+
+echo "$RUN_NUM,total,$total_pkg,$total_cores,$total_gpu,$total_ram,$total_wall,$total_user,$total_sys,$total_ram_raw,$total_wall_container,$taxa_pkg_w,$taxa_cores_w,$taxa_ram_w" \
+  >> "$CSV_FILE"
+
+echo ""
+echo ""
+echo "Run $RUN_NUM finished - $(date '+%H:%M:%S')"
+echo " CSV: $CSV_FILE"
+echo " Total: pkg=${total_pkg}J | wall=${total_wall}s"
+echo ""
+echo ""
+
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+
+## Run $RUN_NUM - $PROJECT_NAME
+
+| Stage | pkg (J) | cores (J) | gpu (J) | ram (J) | wall (s) | exit |
+|-------|---------|-----------|---------|---------|----------|------|
+$(grep "^$RUN_NUM," "$CSV_FILE" | awk -F',' -v ex="$EXITS_FILE" 'BEGIN { while ((getline l < ex) > 0) { split(l, a, ","); e[a[2]] = a[3] } } {printf "| %s | %s | %s | %s | %s | %s | %s |\n", $2,$3,$4,$5,$6,$7,($2 in e ? e[$2] : "-")}')
+EOF
+fi
+
+rm -f "$TIME_FILE"
+
+if [ "$PIPELINE_EXIT" -ne 0 ]; then
+  echo "Run $RUN_NUM: stage(s) with non-zero exit  $FAILED_STAGES"
+  echo "  CSV: $CSV_FILE  exit codes: $EXITS_FILE"
+  exit "$PIPELINE_EXIT"
+fi
